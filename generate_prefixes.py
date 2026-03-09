@@ -17,7 +17,7 @@ from make_prefix import TrajectorySegmenter
 
 
 # Models where reasoning is in a separate field (thinking models with <think> tags)
-SEPARATE_REASONING_MODELS = {"qwen3-235b-thinking"}
+SEPARATE_REASONING_MODELS = {"qwen3-235b-thinking", "qwen3.5-27b", "qwen3.5-35b-a3b"}
 
 
 def get_reasoning_text(record: dict, model: str) -> str | None:
@@ -115,7 +115,7 @@ def main():
         "--model",
         type=str,
         required=True,
-        choices=["qwen3-235b-thinking", "gpt5-mini"],
+        choices=["qwen3-235b-thinking", "gpt5-mini", "qwen3.5-27b", "qwen3.5-35b-a3b"],
         help="Model whose traces to process",
     )
     parser.add_argument("--input-dir", type=str, default="traces")

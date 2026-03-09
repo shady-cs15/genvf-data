@@ -32,6 +32,16 @@ MODELS = {
         "api_key_env": "OPENAI_API_KEY",
         "temperature": None,  # gpt-5-mini only supports default (1)
     },
+    "qwen3.5-27b": {
+        "model_id": "qwen/qwen3.5-27b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
+    "qwen3.5-35b-a3b": {
+        "model_id": "qwen/qwen3.5-35b-a3b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
 }
 
 # ── Token budgets by problem type ────────────────────────────────────────────
