@@ -5,9 +5,17 @@ For each prefix, constructs a prompt with the original problem and the prefix
 as a partial assistant response, then lets the model continue generating.
 
 Usage:
-    python generate_suffixes.py --model qwen3-235b-thinking --start 0 --end 1
-    python generate_suffixes.py --model qwen3-235b-thinking --num-suffixes 8
-    python generate_suffixes.py --model qwen3-235b-thinking --start 0 --end 100 --concurrency 8
+    python generate_suffixes_from_gemini.py \
+    --model gemini-3-flash \
+    --hf-dataset haoranli-ml/genvf-prefixes-filtered \
+    --hf-split train_replaced_none_prefix \
+    --num-suffixes 8 \
+    --concurrency 16 \
+    --output-dir /path/to/suffixes
+
+    python generate_suffixes_from_gemini.py --model gemini-3-flash --start 0 --end 1
+    python generate_suffixes_from_gemini.py --model gemini-3-pro --num-suffixes 8
+    python generate_suffixes_from_gemini.py --model gemini-3-flash --start 0 --end 100 --concurrency 8
 """
 
 import asyncio
@@ -15,6 +23,8 @@ import json
 import os
 import argparse
 import time
+import re
+import random
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -28,28 +38,166 @@ MODELS = {
         "api_key_env": "OPENROUTER_API_KEY",
         "temperature": 0.6,
     },
+    "gemini-3-flash": {
+        "model_id": "gemini-3-flash-preview",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "temperature": None,  # Use Gemini's server-side default unless overridden via CLI
+    },
+    "gemini-3-pro": {
+        "model_id": "gemini-3-pro-preview",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "temperature": None,  # Use Gemini's server-side default unless overridden via CLI
+    },
     "gpt5-mini": {
         "model_id": "gpt-5-mini",
         "base_url": "https://api.openai.com/v1",
         "api_key_env": "OPENAI_API_KEY",
         "temperature": None,
     },
+    "qwen3.5-27b": {
+        "model_id": "qwen/qwen3.5-27b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
+    "qwen3.5-35b-a3b": {
+        "model_id": "qwen/qwen3.5-35b-a3b",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
 }
 
-# Models that use <think> tags for reasoning
-THINK_TAG_MODELS = {"qwen3-235b-thinking"}
+# Models that use explicit reasoning tags
+THINK_TAG_MODELS = {"qwen3-235b-thinking", "gemini-3-flash", "gemini-3-pro"}
+MODEL_THINK_TAGS = {
+    "qwen3-235b-thinking": "think",
+    "gemini-3-flash": "thought",
+    "gemini-3-pro": "thought",
+}
+
+# Models that use multi-turn continuation (no prefill support)
+# Prefix is placed as a prior assistant turn, then a follow-up user message asks to continue.
+MULTI_TURN_MODELS = {"qwen3.5-27b", "qwen3.5-35b-a3b", "gpt5-mini"}
 
 # Models where suffix generation is not supported
 UNSUPPORTED_MODELS = {"gpt5-mini"}
 
+# Pool of models for --model random
+RANDOM_POOL = [
+    "qwen3-235b-thinking",
+    "gpt5-mini",
+    "qwen3.5-27b",
+    "qwen3.5-35b-a3b",
+    "gemini-3-flash",
+    "gemini-3-pro",
+]
+
+# Models that write a dummy placeholder instead of calling the API
+DUMMY_MODELS = {"gemini-3-flash", "gemini-3-pro"}
+
 # ── Token budgets by problem type ────────────────────────────────────────────
-INITIAL_MAX_TOKENS_MATH = 32768
-INITIAL_MAX_TOKENS_PROOF = 76800
+# INITIAL_MAX_TOKENS_MATH = 32768
+# INITIAL_MAX_TOKENS_PROOF = 76800
+# MAX_BUDGET_ESCALATIONS = 3  # how many times to double the budget on truncation
+# ABSOLUTE_MAX_TOKENS = 229376
+
+INITIAL_MAX_TOKENS_MATH = 50000
+INITIAL_MAX_TOKENS_PROOF = 120000
 MAX_BUDGET_ESCALATIONS = 3  # how many times to double the budget on truncation
-ABSOLUTE_MAX_TOKENS = 131072  # qwen3-235b-thinking context length
+ABSOLUTE_MAX_TOKENS = 229376
 
 
-def load_records(path: Path) -> dict[int, dict]:
+def classify_error(error_type: str | None, error_msg: str | None) -> str:
+    """Classify errors for live stats reporting."""
+    text = f"{error_type or ''} {error_msg or ''}".lower()
+    if "429" in text or "ratelimit" in text or "rate limit" in text or "too many requests" in text:
+        return "rate_limit"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    return "other"
+
+
+async def periodic_stats_reporter(
+    stats: dict[str, int],
+    total_tasks: int,
+    done_event: asyncio.Event,
+    interval: int = 30,
+):
+    """Print progress and counters every interval seconds while running."""
+    while True:
+        try:
+            await asyncio.wait_for(done_event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            completed = (
+                stats["stop"]
+                + stats["length"]
+                + stats["other_finish"]
+                + stats["rate_limit"]
+                + stats["timeout"]
+                + stats["other"]
+            )
+            print(
+                "[stats] "
+                f"{completed}/{total_tasks} done | "
+                f"stop={stats['stop']} | "
+                f"length={stats['length']} | "
+                f"429={stats['rate_limit']} | "
+                f"timeout={stats['timeout']} | "
+                f"other_err={stats['other']}"
+            )
+
+
+def load_prefix_rows(path: Path) -> list[dict]:
+    """Load prefix JSONL records as a row list (preserve every row)."""
+    rows = []
+    if path.exists():
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if "index" not in record:
+                        continue
+                    record = dict(record)
+                    record["row_id"] = len(rows)
+                    rows.append(record)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return rows
+
+
+def load_prefix_rows_from_hf(dataset_name: str, split: str) -> list[dict]:
+    """Load HF dataset records as a row list (preserve every row).
+
+    Assumes column names are the same as local jsonl keys.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            "Hugging Face mode requires `datasets`. Install with: pip install datasets"
+        ) from e
+
+    ds = load_dataset(dataset_name, split=split)
+    rows = []
+
+    for row in ds:
+        idx = row.get("index")
+        if idx is None:
+            continue
+        record = dict(row)
+        record["index"] = int(idx)
+        record["row_id"] = len(rows)
+        rows.append(record)
+
+    return rows
+
+
+def load_records_by_index(path: Path) -> dict[int, dict]:
     """Load JSONL records keyed by index."""
     records = {}
     if path.exists():
@@ -66,8 +214,23 @@ def load_records(path: Path) -> dict[int, dict]:
     return records
 
 
-def load_completed_suffixes(path: Path) -> dict[int, list[dict]]:
-    """Load completed suffixes grouped by index."""
+def completed_key(record: dict) -> tuple[str, int] | None:
+    """Return resume key; prefer row_id so duplicate indices are independent."""
+    if "row_id" in record:
+        try:
+            return ("row_id", int(record["row_id"]))
+        except (TypeError, ValueError):
+            return None
+    if "index" in record:
+        try:
+            return ("index", int(record["index"]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def load_completed_suffixes(path: Path) -> dict[tuple[str, int], list[dict]]:
+    """Load completed suffixes grouped by resume key."""
     completed = {}
     if path.exists():
         with open(path) as f:
@@ -77,10 +240,12 @@ def load_completed_suffixes(path: Path) -> dict[int, list[dict]]:
                     continue
                 try:
                     record = json.loads(line)
-                    idx = record["index"]
-                    if idx not in completed:
-                        completed[idx] = []
-                    completed[idx].append(record)
+                    key = completed_key(record)
+                    if key is None:
+                        continue
+                    if key not in completed:
+                        completed[key] = []
+                    completed[key].append(record)
                 except (json.JSONDecodeError, KeyError):
                     continue
     return completed
@@ -101,7 +266,7 @@ def extract_original_suffix(prefix_record: dict, trace_record: dict, model: str)
 
     # Extract the suffix portion of the reasoning (everything after the prefix)
     if model in THINK_TAG_MODELS:
-        full_reasoning = trace_record.get("reasoning", "")
+        full_reasoning = trace_record.get("reasoning") or ""
         # Find where the prefix ends in the full reasoning
         prefix_pos = full_reasoning.find(prefix)
         if prefix_pos == -1:
@@ -112,6 +277,7 @@ def extract_original_suffix(prefix_record: dict, trace_record: dict, model: str)
 
     return {
         "index": prefix_record["index"],
+        "row_id": prefix_record["row_id"],
         "suffix_num": 0,
         "problem": prefix_record["problem"],
         "answer": prefix_record.get("answer"),
@@ -126,6 +292,8 @@ def extract_original_suffix(prefix_record: dict, trace_record: dict, model: str)
         "finish_reason": "stop",
         "budget_used": 0,
         "escalation": 0,
+        "prefix_model": prefix_record.get("model"),
+        "suffix_model": trace_record.get("model"),
         "model": trace_record.get("model"),
         "usage": trace_record.get("usage"),
         "from_original_trace": True,
@@ -135,7 +303,7 @@ def extract_original_suffix(prefix_record: dict, trace_record: dict, model: str)
 def build_messages(prefix_record: dict, model: str) -> list[dict]:
     """Build the message list for suffix generation.
 
-    For thinking models (Qwen3): prefill the assistant's <think> block with the prefix.
+    For thinking models, prefill the assistant's reasoning block with the prefix.
     """
     problem = prefix_record["problem"]
     prefix = prefix_record["prefix"]
@@ -148,13 +316,49 @@ def build_messages(prefix_record: dict, model: str) -> list[dict]:
     else:
         user_prompt = f"{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
-    if model in THINK_TAG_MODELS:
-        # Prefill assistant with open <think> tag + prefix reasoning
-        # The model will continue reasoning, close </think>, and write the answer
-        assistant_prefill = f"<think>\n{prefix}"
+    if model in MULTI_TURN_MODELS:
+        # These models don't support assistant prefill continuation.
+        # Use multi-turn: place prefix as a prior assistant turn, then ask to continue.
+        system_prompt = (
+            "You are continuing a partial chain-of-thought reasoning. "
+            "Write ONLY the continuation of the mathematical reasoning. "
+            "Do NOT include any meta-commentary such as 'The user wants...', "
+            "'Let me continue...', 'I need to...', or any preamble about what "
+            "the problem is asking. Jump straight into the next step of the reasoning."
+        )
+        if is_proof:
+            continue_prompt = (
+                "Continue the reasoning from exactly where it left off. "
+                "Do not restart, repeat previous steps, or add any preamble. "
+                "Jump directly into the next reasoning step and provide a rigorous proof."
+            )
+        else:
+            continue_prompt = (
+                "Continue the reasoning from exactly where it left off. "
+                "Do not restart, repeat previous steps, or add any preamble. "
+                "Jump directly into the next reasoning step and put your final answer within \\boxed{}."
+            )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": prefix},
+            {"role": "user", "content": continue_prompt},
+        ]
+    elif model in THINK_TAG_MODELS:
+        # Prefill assistant with an open reasoning tag + prefix reasoning.
+        # The model then continues reasoning and writes the answer.
+        think_tag = MODEL_THINK_TAGS[model]
+        assistant_prefill = f"<{think_tag}>\n{prefix}"
+
+        # OpenRouter/DeepSeek style "prefix": true can help for some models (e.g., Qwen),
+        # while Gemini works more reliably with plain assistant prefill.
+        assistant_msg = {"role": "assistant", "content": assistant_prefill}
+        if model == "qwen3-235b-thinking":
+            assistant_msg["prefix"] = True
+
         return [
             {"role": "user", "content": user_prompt},
-            {"role": "assistant", "prefix": True, "content": assistant_prefill},
+            assistant_msg,
         ]
     else:
         raise NotImplementedError(
@@ -162,6 +366,73 @@ def build_messages(prefix_record: dict, model: str) -> list[dict]:
             f"internal chain-of-thought is not exposed by the API, "
             f"so prefix continuation is not possible."
         )
+
+
+def extract_reasoning_from_message(message, content: str | None) -> str | None:
+    """Extract reasoning text from model response, with tag-based fallback."""
+    if hasattr(message, "reasoning_content") and message.reasoning_content:
+        return message.reasoning_content
+    if hasattr(message, "reasoning") and message.reasoning:
+        return message.reasoning
+
+    if isinstance(content, str) and content:
+        for tag in ("thought", "think"):
+            m = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", content, flags=re.DOTALL)
+            if m:
+                extracted = m.group(1).strip()
+                if extracted:
+                    return extracted
+    return None
+
+
+def extract_thought_tags_from_response(content: str | None) -> str | None:
+    """Extract all <thought>...</thought> blocks from response text."""
+    if not isinstance(content, str) or not content:
+        return None
+    matches = re.findall(r"<thought>\s*(.*?)\s*</thought>", content, flags=re.DOTALL | re.IGNORECASE)
+    chunks = [m.strip() for m in matches if isinstance(m, str) and m.strip()]
+    if not chunks:
+        return None
+    return "\n\n".join(chunks)
+
+
+async def write_dummy_suffix(
+    prefix_record: dict,
+    suffix_num: int,
+    model: str,
+    write_lock: asyncio.Lock,
+    output_file,
+):
+    """Write a placeholder suffix record for models that need manual generation later."""
+    model_cfg = MODELS[model]
+    result = {
+        "index": prefix_record["index"],
+        "row_id": prefix_record["row_id"],
+        "suffix_num": suffix_num,
+        "problem": prefix_record["problem"],
+        "answer": prefix_record.get("answer"),
+        "source": prefix_record.get("source"),
+        "mean_reward": prefix_record.get("mean_reward"),
+        "prefix": prefix_record["prefix"],
+        "prefix_type": prefix_record.get("prefix_type"),
+        "prefix_end_index": prefix_record.get("prefix_end_index"),
+        "num_thoughts": prefix_record.get("num_thoughts"),
+        "suffix_response": None,
+        "suffix_reasoning": None,
+        "finish_reason": None,
+        "budget_used": None,
+        "escalation": None,
+        "prefix_model": prefix_record.get("model"),
+        "suffix_model": model_cfg["model_id"],
+        "model": model_cfg["model_id"],
+        "usage": None,
+        "pending": True,
+        "pending_model": model,
+    }
+    async with write_lock:
+        output_file.write(json.dumps(result) + "\n")
+        output_file.flush()
+    return result
 
 
 async def generate_one_suffix(
@@ -180,6 +451,7 @@ async def generate_one_suffix(
     async with semaphore:
         messages = build_messages(prefix_record, model)
         index = prefix_record["index"]
+        row_id = prefix_record["row_id"]
         answer = prefix_record.get("answer")
         is_proof = answer is None or str(answer).strip() in ("", "None")
         base_budget = INITIAL_MAX_TOKENS_PROOF if is_proof else INITIAL_MAX_TOKENS_MATH
@@ -205,15 +477,19 @@ async def generate_one_suffix(
                     choice = response.choices[0]
 
                     # Extract reasoning/thinking if present
-                    reasoning = None
                     content = choice.message.content
-                    if hasattr(choice.message, "reasoning_content") and choice.message.reasoning_content:
-                        reasoning = choice.message.reasoning_content
-                    elif hasattr(choice.message, "reasoning") and choice.message.reasoning:
-                        reasoning = choice.message.reasoning
+                    reasoning = extract_reasoning_from_message(choice.message, content)
+                    thought_reasoning = extract_thought_tags_from_response(content)
+                    if thought_reasoning:
+                        if isinstance(reasoning, str) and reasoning.strip():
+                            if thought_reasoning not in reasoning:
+                                reasoning = f"{reasoning}\n\n{thought_reasoning}"
+                        else:
+                            reasoning = thought_reasoning
 
                     result = {
                         "index": index,
+                        "row_id": row_id,
                         "suffix_num": suffix_num,
                         "problem": prefix_record["problem"],
                         "answer": prefix_record.get("answer"),
@@ -228,6 +504,8 @@ async def generate_one_suffix(
                         "finish_reason": choice.finish_reason,
                         "budget_used": budget,
                         "escalation": escalation,
+                        "prefix_model": prefix_record.get("model"),
+                        "suffix_model": response.model,
                         "model": response.model,
                         "usage": {
                             "prompt_tokens": response.usage.prompt_tokens,
@@ -258,6 +536,7 @@ async def generate_one_suffix(
                 # All retries exhausted at this budget level — write error
                 result = {
                     "index": index,
+                    "row_id": row_id,
                     "suffix_num": suffix_num,
                     "problem": prefix_record["problem"],
                     "answer": prefix_record.get("answer"),
@@ -265,6 +544,8 @@ async def generate_one_suffix(
                     "suffix_response": None,
                     "finish_reason": None,
                     "budget_used": budget,
+                    "prefix_model": prefix_record.get("model"),
+                    "suffix_model": model_id,
                     "error": str(last_error),
                     "error_type": type(last_error).__name__,
                 }
@@ -287,6 +568,7 @@ async def generate_one_suffix(
         # Shouldn't reach here, but just in case
         result = {
             "index": index,
+            "row_id": row_id,
             "suffix_num": suffix_num,
             "problem": prefix_record["problem"],
             "answer": prefix_record.get("answer"),
@@ -294,6 +576,8 @@ async def generate_one_suffix(
             "suffix_response": None,
             "finish_reason": None,
             "budget_used": None,
+            "prefix_model": prefix_record.get("model"),
+            "suffix_model": model_id,
             "error": str(last_error) if last_error else "Unknown error",
             "error_type": type(last_error).__name__ if last_error else "Unknown",
         }
@@ -309,109 +593,127 @@ async def main():
         "--model",
         type=str,
         required=True,
-        choices=list(MODELS.keys()),
-        help="Model to use for suffix generation",
+        choices=list(MODELS.keys()) + ["random"],
+        help="Model to use for suffix generation (use 'random' to sample from pool)",
     )
-    parser.add_argument("--trace-dir", type=str, default="traces")
+    parser.add_argument("--trace-dir", type=str, default="traces",
+                        help="Unused (trace reuse disabled)")
     parser.add_argument("--prefix-dir", type=str, default="prefixes")
     parser.add_argument("--output-dir", type=str, default="suffixes")
-    parser.add_argument("--num-suffixes", "-n", type=int, default=7,
+    parser.add_argument("--hf-dataset", type=str, default=None,
+                        help="Optional HF dataset name/path for prefixes")
+    parser.add_argument("--hf-split", type=str, default="train",
+                        help="HF split (used with --hf-dataset)")
+    parser.add_argument("--num-suffixes", "-n", type=int, default=1,
                         help="Number of suffixes to generate per prefix")
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=None,
                         help="Override temperature")
-    parser.add_argument("--start", type=int, default=0, help="Start index (inclusive)")
-    parser.add_argument("--end", type=int, default=None, help="End index (exclusive)")
+    parser.add_argument("--start", type=int, default=0, help="Start row (inclusive)")
+    parser.add_argument("--end", type=int, default=None, help="End row (exclusive)")
+    parser.add_argument("--seed", type=int, default=2026, help="Random seed (used with --model random)")
     args = parser.parse_args()
 
     model = args.model
+    is_random = model == "random"
 
-    if model in UNSUPPORTED_MODELS:
+    if not is_random and model in UNSUPPORTED_MODELS:
         raise NotImplementedError(
             f"Suffix generation not supported for model '{model}': "
             f"internal chain-of-thought is not exposed by the API, "
             f"so prefix continuation is not possible."
         )
 
-    model_cfg = MODELS[model]
-    model_id = model_cfg["model_id"]
-
-    # Temperature: CLI > per-model > default 0.6
-    if args.temperature is not None:
-        temperature = args.temperature
-    elif "temperature" in model_cfg:
-        temperature = model_cfg["temperature"]
+    if is_random:
+        rng = random.Random(args.seed)
+        output_path = Path(args.output_dir) / "random.jsonl"
     else:
-        temperature = 0.6
+        model_cfg = MODELS[model]
+        model_id = model_cfg["model_id"]
+        output_path = Path(args.output_dir) / f"{model}.jsonl"
 
-    trace_path = Path(args.trace_dir) / f"{model}.jsonl"
-    prefix_path = Path(args.prefix_dir) / f"{model}.jsonl"
-    output_path = Path(args.output_dir) / f"{model}.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not prefix_path.exists():
-        raise FileNotFoundError(f"Prefix file not found: {prefix_path}")
+    # Temperature: CLI > per-model > default 0.6
+    def get_temperature(m: str) -> float | None:
+        if args.temperature is not None:
+            return args.temperature
+        cfg = MODELS[m]
+        if "temperature" in cfg:
+            return cfg["temperature"]
+        return 0.6
 
-    # Load prefixes and original traces
-    prefixes = load_records(prefix_path)
-    traces = load_records(trace_path) if trace_path.exists() else {}
+    # Resolve prefix path: for random mode, must use --hf-dataset or --prefix-dir with a specific file
+    if is_random:
+        prefix_path = Path(args.prefix_dir) / "merged_v0.jsonl"
+    else:
+        prefix_path = Path(args.prefix_dir) / f"{model}.jsonl"
 
-    # Determine index range
-    all_indices = sorted(prefixes.keys())
-    start = args.start
-    end = args.end if args.end is not None else max(all_indices) + 1
-    indices = [i for i in all_indices if start <= i < end]
+    # Load prefixes as rows (no trace reuse)
+    if args.hf_dataset:
+        prefix_rows = load_prefix_rows_from_hf(args.hf_dataset, args.hf_split)
+    else:
+        if not prefix_path.exists():
+            raise FileNotFoundError(f"Prefix file not found: {prefix_path}")
+        prefix_rows = load_prefix_rows(prefix_path)
+
+    if not prefix_rows:
+        raise ValueError("No prefix rows loaded.")
+
+    # Determine row range
+    total_rows = len(prefix_rows)
+    start = max(0, args.start)
+    end = args.end if args.end is not None else total_rows
+    end = min(end, total_rows)
+    if end < start:
+        end = start
+    row_ids = list(range(start, end))
 
     # Filter out skipped prefixes (no content to continue from)
-    indices = [i for i in indices if prefixes[i].get("prefix") is not None]
+    row_ids = [rid for rid in row_ids if prefix_rows[rid].get("prefix") is not None]
 
     # Resume support: check which (index, suffix_num) pairs are done
     completed = load_completed_suffixes(output_path)
 
-    # Handle suffix 0 (original trace) separately — write directly, no API call
-    n_original_written = 0
-    with open(output_path, "a") as f:
-        for idx in indices:
-            existing = completed.get(idx, [])
-            existing_nums = {r["suffix_num"] for r in existing}
-            if 0 in existing_nums:
-                continue
-            if idx in traces:
-                original = extract_original_suffix(prefixes[idx], traces[idx], model)
-                if original is not None:
-                    f.write(json.dumps(original) + "\n")
-                    f.flush()
-                    # Track it as completed
-                    if idx not in completed:
-                        completed[idx] = []
-                    completed[idx].append(original)
-                    n_original_written += 1
-
-    if n_original_written:
-        print(f"Wrote {n_original_written} original trace suffixes (suffix 0)")
-
-    # Build remaining tasks: suffix 0 that needs regeneration + suffixes 1..N-1
+    # Build remaining tasks
+    # For random mode, pre-assign a model to each (rid, suffix_num) deterministically
+    task_models = {}  # (rid, suffix_num) -> model alias
     tasks_to_run = []
-    for idx in indices:
-        existing = completed.get(idx, [])
+    for rid in row_ids:
+        key = ("row_id", rid)
+        existing = completed.get(key, [])
         existing_nums = {r["suffix_num"] for r in existing}
         for s in range(args.num_suffixes):
+            if is_random:
+                task_models[(rid, s)] = rng.choice(RANDOM_POOL)
             if s not in existing_nums:
-                tasks_to_run.append((idx, s))
+                tasks_to_run.append((rid, s))
 
-    n_total = len(indices) * args.num_suffixes
+    n_total = len(row_ids) * args.num_suffixes
     n_done = n_total - len(tasks_to_run)
 
-    print(f"Model:       {model_id}")
-    print(f"Prefixes:    {prefix_path} ({len(prefixes)} records)")
-    print(f"Range:       [{start}, {end})")
-    print(f"Indices:     {len(indices)} (with valid prefix)")
+    print(f"Model:       {'random (mixed pool)' if is_random else MODELS[model]['model_id']}")
+    if is_random:
+        # Count model assignments for remaining tasks
+        from collections import Counter
+        task_model_counts = Counter(task_models[k] for k in tasks_to_run)
+        print(f"Random pool: {RANDOM_POOL}")
+        print(f"Seed:        {args.seed}")
+        print(f"Model distribution (remaining): {dict(task_model_counts)}")
+    if args.hf_dataset:
+        print(f"Prefixes:    hf://{args.hf_dataset} ({len(prefix_rows)} rows, split={args.hf_split})")
+    else:
+        print(f"Prefixes:    {prefix_path} ({len(prefix_rows)} rows)")
+    print(f"Row range:   [{start}, {end})")
+    print(f"Rows:        {len(row_ids)} (with valid prefix)")
+    print("Trace reuse: disabled")
     print(f"Suffixes/prefix: {args.num_suffixes}")
     print(f"Total jobs:  {n_total}")
     print(f"Completed:   {n_done}")
     print(f"Remaining:   {len(tasks_to_run)}")
     print(f"Concurrency: {args.concurrency}")
-    print(f"Temperature: {temperature}")
+    if not is_random:
+        print(f"Temperature: {get_temperature(model)}")
     print(f"Output:      {output_path}")
     print()
 
@@ -419,58 +721,140 @@ async def main():
         print("All suffixes already generated!")
         return
 
-    # Setup client
-    api_key_env = model_cfg["api_key_env"]
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        raise RuntimeError(f"{api_key_env} environment variable not set")
+    # Setup clients — one per unique (base_url, api_key_env) pair
+    clients = {}
+    if is_random:
+        models_needed = set(task_models[k] for k in tasks_to_run) - DUMMY_MODELS
+    else:
+        models_needed = {model} - DUMMY_MODELS
 
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=model_cfg["base_url"],
-        max_retries=0,
-        timeout=3600,
-    )
+    for m in models_needed:
+        cfg = MODELS[m]
+        client_key = (cfg["base_url"], cfg["api_key_env"])
+        if client_key not in clients:
+            api_key = os.environ.get(cfg["api_key_env"])
+            if not api_key:
+                raise RuntimeError(f"{cfg['api_key_env']} environment variable not set (needed for {m})")
+            clients[client_key] = AsyncOpenAI(
+                api_key=api_key,
+                base_url=cfg["base_url"],
+                max_retries=0,
+                timeout=3600,
+            )
+
+    def get_client(m: str) -> AsyncOpenAI:
+        cfg = MODELS[m]
+        return clients[(cfg["base_url"], cfg["api_key_env"])]
 
     semaphore = asyncio.Semaphore(args.concurrency)
     write_lock = asyncio.Lock()
+    stats = {
+        "stop": 0,
+        "length": 0,
+        "other_finish": 0,
+        "rate_limit": 0,
+        "timeout": 0,
+        "other": 0,
+        "dummy": 0,
+    }
+    done_event = asyncio.Event()
 
     t0 = time.time()
     with open(output_path, "a") as f:
-        coros = [
-            generate_one_suffix(
-                client,
-                model_id,
-                model,
-                prefixes[idx],
-                suffix_num,
-                semaphore,
-                write_lock,
-                f,
-                temperature,
-            )
-            for idx, suffix_num in tasks_to_run
-        ]
+        coros = []
+        for rid, suffix_num in tasks_to_run:
+            task_model = task_models[(rid, suffix_num)] if is_random else model
+            if task_model in DUMMY_MODELS:
+                coros.append(
+                    write_dummy_suffix(
+                        prefix_rows[rid],
+                        suffix_num,
+                        task_model,
+                        write_lock,
+                        f,
+                    )
+                )
+            else:
+                task_cfg = MODELS[task_model]
+                coros.append(
+                    generate_one_suffix(
+                        get_client(task_model),
+                        task_cfg["model_id"],
+                        task_model,
+                        prefix_rows[rid],
+                        suffix_num,
+                        semaphore,
+                        write_lock,
+                        f,
+                        get_temperature(task_model),
+                    )
+                )
+
+        reporter_task = asyncio.create_task(
+            periodic_stats_reporter(stats=stats, total_tasks=len(coros), done_event=done_event, interval=30)
+        )
 
         results = []
+        desc = "Suffixes (random)" if is_random else f"Suffixes ({model})"
         for coro in atqdm(
             asyncio.as_completed(coros),
             total=len(coros),
-            desc=f"Suffixes ({model})",
+            desc=desc,
         ):
             result = await coro
             results.append(result)
+            if result.get("pending"):
+                stats["dummy"] += 1
+            elif result.get("suffix_response") is not None:
+                finish_reason = result.get("finish_reason")
+                if finish_reason == "stop":
+                    stats["stop"] += 1
+                elif finish_reason == "length":
+                    stats["length"] += 1
+                else:
+                    stats["other_finish"] += 1
+            else:
+                bucket = classify_error(result.get("error_type"), result.get("error"))
+                stats[bucket] += 1
+
+        done_event.set()
+        await reporter_task
 
     elapsed = time.time() - t0
     n_stop = sum(1 for r in results if r.get("finish_reason") == "stop")
     n_length = sum(1 for r in results if r.get("finish_reason") == "length")
-    n_error = sum(1 for r in results if r.get("suffix_response") is None)
+    n_dummy = sum(1 for r in results if r.get("pending"))
+    n_error = sum(1 for r in results if r.get("suffix_response") is None and not r.get("pending"))
+    n_other_finish = sum(
+        1
+        for r in results
+        if r.get("suffix_response") is not None and r.get("finish_reason") not in {"stop", "length"}
+    )
+    n_rate_limit = sum(
+        1
+        for r in results
+        if r.get("suffix_response") is None and not r.get("pending")
+        and classify_error(r.get("error_type"), r.get("error")) == "rate_limit"
+    )
+    n_timeout = sum(
+        1
+        for r in results
+        if r.get("suffix_response") is None and not r.get("pending")
+        and classify_error(r.get("error_type"), r.get("error")) == "timeout"
+    )
+    n_other_error = n_error - n_rate_limit - n_timeout
 
     print()
     print(f"Done in {elapsed:.1f}s")
     print(f"  Finished (stop):    {n_stop}")
     print(f"  Truncated (length): {n_length}")
+    if n_dummy:
+        print(f"  Dummy (pending):    {n_dummy}")
+    print(f"  Other finish:       {n_other_finish}")
     print(f"  Errors:             {n_error}")
+    print(f"    Rate limit (429): {n_rate_limit}")
+    print(f"    Timeout:          {n_timeout}")
+    print(f"    Other errors:     {n_other_error}")
     print(f"  Output:             {output_path}")
 
 

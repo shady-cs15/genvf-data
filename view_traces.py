@@ -44,6 +44,27 @@ def load_jsonl(path: str) -> list[dict]:
     return records
 
 
+def detect_file_type(records: list[dict]) -> str:
+    """Detect if records are traces, prefixes, or suffixes."""
+    if not records:
+        return "unknown"
+    r = records[0]
+    if "suffix_response" in r or "pending" in r:
+        return "suffix"
+    if "prefix_type" in r:
+        return "prefix"
+    return "trace"
+
+
+def records_by_row_id(records: list[dict]) -> dict[int, dict]:
+    """Key records by row_id (sequential position), falling back to enumeration."""
+    result = {}
+    for i, r in enumerate(records):
+        rid = r.get("row_id", i)
+        result[rid] = r
+    return result
+
+
 def records_by_index(records: list[dict]) -> dict[int, dict]:
     return {r["index"]: r for r in records}
 
@@ -60,10 +81,12 @@ def show_stats(records: list[dict], path: str):
         console.print("[red]Empty file!")
         return
 
-    # Detect file type (trace vs prefix)
-    is_prefix = "prefix_type" in records[0]
+    # Detect file type
+    file_type = detect_file_type(records)
 
-    if is_prefix:
+    if file_type == "suffix":
+        _show_suffix_stats(records, path)
+    elif file_type == "prefix":
         _show_prefix_stats(records, path)
     else:
         _show_trace_stats(records, path)
@@ -199,6 +222,113 @@ def _show_prefix_stats(records: list[dict], path: str):
         _print_histogram(end_indices, "Prefix End Index Distribution", bins=10)
 
 
+def _show_suffix_stats(records: list[dict], path: str):
+    total = len(records)
+
+    # Unique indices and row_ids
+    unique_indices = len(set(r["index"] for r in records))
+    unique_row_ids = len(set(r.get("row_id", i) for i, r in enumerate(records)))
+
+    # Finish reasons
+    finish_reasons = {}
+    for r in records:
+        if r.get("pending"):
+            fr = "pending"
+        else:
+            fr = r.get("finish_reason") or "null/error"
+        finish_reasons[fr] = finish_reasons.get(fr, 0) + 1
+
+    # Model distribution
+    models = {}
+    for r in records:
+        m = r.get("suffix_model") or r.get("pending_model") or "?"
+        models[m] = models.get(m, 0) + 1
+
+    # Prefix model distribution
+    prefix_models = {}
+    for r in records:
+        m = r.get("prefix_model") or "?"
+        prefix_models[m] = prefix_models.get(m, 0) + 1
+
+    # Suffix nums
+    suffix_nums = {}
+    for r in records:
+        sn = r.get("suffix_num", 0)
+        suffix_nums[sn] = suffix_nums.get(sn, 0) + 1
+
+    # Generated vs pending vs error
+    n_generated = sum(1 for r in records if r.get("suffix_response") is not None)
+    n_pending = sum(1 for r in records if r.get("pending"))
+    n_error = total - n_generated - n_pending
+
+    # Token stats (only for generated)
+    tokens = [r["usage"]["completion_tokens"] for r in records if r.get("usage") and r["usage"]]
+    avg_tokens = sum(tokens) / len(tokens) if tokens else 0
+
+    # Response lengths
+    resp_lens = [len(r["suffix_response"]) for r in records if r.get("suffix_response")]
+    avg_resp_len = sum(resp_lens) / len(resp_lens) if resp_lens else 0
+
+    # Overview table
+    t = Table(title="Overview", box=box.ROUNDED, show_header=False, title_style="bold green")
+    t.add_column("Metric", style="bold")
+    t.add_column("Value", style="cyan")
+    t.add_row("File", str(path))
+    t.add_row("Total records", str(total))
+    t.add_row("Unique indices", str(unique_indices))
+    t.add_row("Unique row_ids", str(unique_row_ids))
+    t.add_row("Generated", f"{n_generated} ({n_generated*100/total:.1f}%)")
+    t.add_row("Pending (dummy)", f"{n_pending} ({n_pending*100/total:.1f}%)")
+    t.add_row("Errors", f"{n_error} ({n_error*100/total:.1f}%)")
+    if tokens:
+        t.add_row("Avg completion tokens", f"{avg_tokens:,.0f}")
+    t.add_row("Avg response length", f"{avg_resp_len:,.0f} chars")
+    console.print(t)
+    console.print()
+
+    # Finish reasons
+    t2 = Table(title="Finish Reason", box=box.ROUNDED)
+    t2.add_column("Reason", style="bold")
+    t2.add_column("Count", justify="right")
+    t2.add_column("%", justify="right")
+    reason_colors = {"stop": "green", "length": "yellow", "pending": "blue"}
+    for reason, count in sorted(finish_reasons.items(), key=lambda x: -x[1]):
+        color = reason_colors.get(reason, "red")
+        t2.add_row(f"[{color}]{reason}", str(count), f"{count*100/total:.1f}")
+
+    # Suffix model distribution
+    t3 = Table(title="Suffix Model", box=box.ROUNDED)
+    t3.add_column("Model", style="bold")
+    t3.add_column("Count", justify="right")
+    t3.add_column("%", justify="right")
+    for m, count in sorted(models.items(), key=lambda x: -x[1]):
+        t3.add_row(m, str(count), f"{count*100/total:.1f}")
+
+    console.print(Columns([t2, t3], padding=(0, 4)))
+    console.print()
+
+    # Prefix model distribution
+    t4 = Table(title="Prefix Model", box=box.ROUNDED)
+    t4.add_column("Model", style="bold")
+    t4.add_column("Count", justify="right")
+    t4.add_column("%", justify="right")
+    for m, count in sorted(prefix_models.items(), key=lambda x: -x[1]):
+        t4.add_row(m, str(count), f"{count*100/total:.1f}")
+
+    # Suffix num distribution
+    t5 = Table(title="Suffix Num", box=box.ROUNDED)
+    t5.add_column("Num", style="bold")
+    t5.add_column("Count", justify="right")
+    for sn, count in sorted(suffix_nums.items()):
+        t5.add_row(str(sn), str(count))
+
+    console.print(Columns([t4, t5], padding=(0, 4)))
+    console.print()
+
+    if resp_lens:
+        _print_histogram(resp_lens, "Response Length Distribution", bins=10)
+
+
 def _print_histogram(values: list, title: str, bins: int = 10):
     """Print an ASCII histogram."""
     if not values:
@@ -234,9 +364,17 @@ def _print_histogram(values: list, title: str, bins: int = 10):
 def show_record(record: dict, path: str):
     """Show a single record in detail."""
     idx = record["index"]
-    is_prefix = "prefix_type" in record
+    file_type = detect_file_type([record])
 
-    console.print(Rule(f"[bold cyan]Record {idx} from {Path(path).name}"))
+    row_id = record.get("row_id")
+    title_parts = [f"Record idx={idx}"]
+    if row_id is not None:
+        title_parts.append(f"row_id={row_id}")
+    if file_type == "suffix":
+        title_parts.append(f"suffix_num={record.get('suffix_num', '?')}")
+    title_parts.append(f"from {Path(path).name}")
+
+    console.print(Rule(f"[bold cyan]{' | '.join(title_parts)}"))
     console.print()
 
     # Metadata panel
@@ -246,23 +384,41 @@ def show_record(record: dict, path: str):
 
     meta_lines = [
         f"[bold]Index:[/bold] {idx}",
+    ]
+    if row_id is not None:
+        meta_lines.append(f"[bold]Row ID:[/bold] {row_id}")
+    meta_lines += [
         f"[bold]Type:[/bold] {problem_type}",
         f"[bold]Source:[/bold] {record.get('source')}",
         f"[bold]Answer:[/bold] {ans}",
         f"[bold]Mean reward:[/bold] {record.get('mean_reward')}",
-        f"[bold]Model:[/bold] {record.get('model')}",
     ]
 
-    if not is_prefix:
-        meta_lines.append(f"[bold]Finish reason:[/bold] {record.get('finish_reason')}")
+    if file_type == "suffix":
+        meta_lines.append(f"[bold]Suffix num:[/bold] {record.get('suffix_num')}")
+        meta_lines.append(f"[bold]Prefix model:[/bold] {record.get('prefix_model')}")
+        meta_lines.append(f"[bold]Suffix model:[/bold] {record.get('suffix_model') or record.get('pending_model')}")
+        if record.get("pending"):
+            meta_lines.append("[bold]Status:[/bold] [blue]PENDING (dummy)[/blue]")
+        else:
+            meta_lines.append(f"[bold]Finish reason:[/bold] {record.get('finish_reason')}")
+            meta_lines.append(f"[bold]Budget used:[/bold] {record.get('budget_used')}")
+            meta_lines.append(f"[bold]Escalation:[/bold] {record.get('escalation')}")
         if record.get("usage"):
             u = record["usage"]
             meta_lines.append(f"[bold]Tokens:[/bold] {u.get('prompt_tokens', '?')} prompt / {u.get('completion_tokens', '?')} completion / {u.get('total_tokens', '?')} total")
-    else:
+    elif file_type == "prefix":
+        meta_lines.append(f"[bold]Model:[/bold] {record.get('model')}")
         meta_lines.append(f"[bold]Prefix type:[/bold] {record.get('prefix_type')}")
         meta_lines.append(f"[bold]Description:[/bold] {record.get('prefix_type_description')}")
         meta_lines.append(f"[bold]Num thoughts:[/bold] {record.get('num_thoughts')}")
         meta_lines.append(f"[bold]Prefix end index:[/bold] {record.get('prefix_end_index')}")
+    else:
+        meta_lines.append(f"[bold]Model:[/bold] {record.get('model')}")
+        meta_lines.append(f"[bold]Finish reason:[/bold] {record.get('finish_reason')}")
+        if record.get("usage"):
+            u = record["usage"]
+            meta_lines.append(f"[bold]Tokens:[/bold] {u.get('prompt_tokens', '?')} prompt / {u.get('completion_tokens', '?')} completion / {u.get('total_tokens', '?')} total")
 
     console.print(Panel("\n".join(meta_lines), title="Metadata", border_style="blue"))
     console.print()
@@ -271,7 +427,38 @@ def show_record(record: dict, path: str):
     console.print(Panel(record.get("problem", "N/A"), title="Problem", border_style="yellow"))
     console.print()
 
-    if is_prefix:
+    if file_type == "suffix":
+        # Show prefix
+        prefix = record.get("prefix")
+        if prefix:
+            _print_truncated(prefix, "Prefix", "cyan", max_chars=2000)
+
+        if record.get("pending"):
+            console.print(Panel(
+                f"[blue]Pending generation with model: {record.get('pending_model')}",
+                title="Suffix (pending)",
+                border_style="blue",
+            ))
+        else:
+            # Show suffix reasoning if present
+            reasoning = record.get("suffix_reasoning")
+            if reasoning:
+                _print_truncated(reasoning, "Suffix Reasoning (CoT)", "magenta", max_chars=2000)
+
+            # Show suffix response
+            response = record.get("suffix_response")
+            if response:
+                _print_truncated(response, "Suffix Response", "green", max_chars=2000)
+            elif record.get("error"):
+                console.print(Panel(
+                    f"[red]{record.get('error_type', 'Error')}: {record.get('error', 'Unknown')}",
+                    title="Error",
+                    border_style="red",
+                ))
+            else:
+                console.print(Panel("[red]No suffix response", title="Suffix Response"))
+
+    elif file_type == "prefix":
         # Show prefix
         prefix = record.get("prefix")
         if prefix:
@@ -279,7 +466,7 @@ def show_record(record: dict, path: str):
         else:
             console.print(Panel("[red]No prefix (skipped)", title="Prefix"))
     else:
-        # Show reasoning if present
+        # Trace: show reasoning if present
         reasoning = record.get("reasoning")
         if reasoning:
             _print_truncated(reasoning, "Reasoning (CoT)", "magenta", max_chars=2000)
@@ -342,47 +529,97 @@ def show_compare(all_files: dict[str, list[dict]], index: int):
 # ── Browse mode ──────────────────────────────────────────────────────────────
 
 def browse(records: list[dict], path: str):
-    """Interactive browse through records."""
-    by_idx = records_by_index(records)
-    indices = sorted(by_idx.keys())
-    pos = 0
+    """Interactive browse through records.
 
-    while True:
-        os.system("clear" if os.name != "nt" else "cls")
-        idx = indices[pos]
-        show_record(by_idx[idx], path)
+    For suffix files, browse sequentially through all records (since multiple
+    records share the same index/row_id). For traces/prefixes, browse by index.
+    """
+    file_type = detect_file_type(records)
 
-        console.print(Rule())
-        console.print(
-            f"[dim]Record {pos + 1}/{len(indices)} | "
-            f"[bold]n[/bold]=next [bold]p[/bold]=prev [bold]j[/bold]=jump [bold]s[/bold]=stats [bold]q[/bold]=quit[/dim]"
-        )
+    if file_type == "suffix":
+        # Browse all records sequentially
+        items = records
+        pos = 0
 
-        try:
-            key = input("> ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            break
-
-        if key in ("n", ""):
-            pos = min(pos + 1, len(indices) - 1)
-        elif key == "p":
-            pos = max(pos - 1, 0)
-        elif key == "j":
-            try:
-                target = int(input("Jump to index: "))
-                if target in by_idx:
-                    pos = indices.index(target)
-                else:
-                    console.print(f"[red]Index {target} not found")
-                    input("Press Enter...")
-            except (ValueError, EOFError):
-                pass
-        elif key == "s":
+        while True:
             os.system("clear" if os.name != "nt" else "cls")
-            show_stats(records, path)
-            input("Press Enter to continue...")
-        elif key == "q":
-            break
+            show_record(items[pos], path)
+
+            r = items[pos]
+            console.print(Rule())
+            console.print(
+                f"[dim]Record {pos + 1}/{len(items)} "
+                f"(row_id={r.get('row_id')}, suffix_num={r.get('suffix_num')}) | "
+                f"[bold]n[/bold]=next [bold]p[/bold]=prev [bold]j[/bold]=jump(pos) [bold]s[/bold]=stats [bold]q[/bold]=quit[/dim]"
+            )
+
+            try:
+                key = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if key in ("n", ""):
+                pos = min(pos + 1, len(items) - 1)
+            elif key == "p":
+                pos = max(pos - 1, 0)
+            elif key == "j":
+                try:
+                    target = int(input("Jump to position (1-based): "))
+                    target -= 1  # convert to 0-based
+                    if 0 <= target < len(items):
+                        pos = target
+                    else:
+                        console.print(f"[red]Position out of range (1-{len(items)})")
+                        input("Press Enter...")
+                except (ValueError, EOFError):
+                    pass
+            elif key == "s":
+                os.system("clear" if os.name != "nt" else "cls")
+                show_stats(records, path)
+                input("Press Enter to continue...")
+            elif key == "q":
+                break
+    else:
+        by_idx = records_by_index(records)
+        indices = sorted(by_idx.keys())
+        pos = 0
+
+        while True:
+            os.system("clear" if os.name != "nt" else "cls")
+            idx = indices[pos]
+            show_record(by_idx[idx], path)
+
+            console.print(Rule())
+            console.print(
+                f"[dim]Record {pos + 1}/{len(indices)} (index={idx}) | "
+                f"[bold]n[/bold]=next [bold]p[/bold]=prev [bold]j[/bold]=jump [bold]s[/bold]=stats [bold]q[/bold]=quit[/dim]"
+            )
+
+            try:
+                key = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if key in ("n", ""):
+                pos = min(pos + 1, len(indices) - 1)
+            elif key == "p":
+                pos = max(pos - 1, 0)
+            elif key == "j":
+                try:
+                    target = int(input("Jump to index: "))
+                    if target in by_idx:
+                        pos = indices.index(target)
+                    else:
+                        console.print(f"[red]Index {target} not found")
+                        input("Press Enter...")
+                except (ValueError, EOFError):
+                    pass
+            elif key == "s":
+                os.system("clear" if os.name != "nt" else "cls")
+                show_stats(records, path)
+                input("Press Enter to continue...")
+            elif key == "q":
+                break
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -403,6 +640,7 @@ Examples:
     parser.add_argument("files", nargs="+", help="JSONL file(s) to view")
     parser.add_argument("--stats", action="store_true", help="Show statistics dashboard")
     parser.add_argument("--index", "-i", type=int, default=None, help="Show a specific record by index")
+    parser.add_argument("--row-id", "-r", type=int, default=None, help="Show a specific record by row_id (useful for suffix files)")
     parser.add_argument("--compare", action="store_true", help="Compare same index across multiple files")
     parser.add_argument("--browse", action="store_true", help="Interactive browse mode")
     parser.add_argument("--errors", action="store_true", help="Show only error records")
@@ -444,7 +682,11 @@ Examples:
         if args.stats:
             show_stats(records, path)
         elif args.errors:
-            error_records = [r for r in records if r.get("response") is None]
+            file_type = detect_file_type(records)
+            if file_type == "suffix":
+                error_records = [r for r in records if r.get("suffix_response") is None and not r.get("pending")]
+            else:
+                error_records = [r for r in records if r.get("response") is None]
             if not error_records:
                 console.print("[green]No errors found!")
             else:
@@ -456,6 +698,12 @@ Examples:
             sampled = random.sample(records, min(args.sample, len(records)))
             for r in sampled:
                 show_record(r, path)
+        elif args.row_id is not None:
+            by_rid = records_by_row_id(records)
+            if args.row_id in by_rid:
+                show_record(by_rid[args.row_id], path)
+            else:
+                console.print(f"[red]row_id {args.row_id} not found in {path}")
         elif args.index is not None:
             by_idx = records_by_index(records)
             if args.index in by_idx:
