@@ -318,31 +318,12 @@ def build_messages(prefix_record: dict, model: str) -> list[dict]:
 
     if model in MULTI_TURN_MODELS:
         # These models don't support assistant prefill continuation.
-        # Use multi-turn: place prefix as a prior assistant turn, then ask to continue.
-        system_prompt = (
-            "You are continuing a partial chain-of-thought reasoning. "
-            "Write ONLY the continuation of the mathematical reasoning. "
-            "Do NOT include any meta-commentary such as 'The user wants...', "
-            "'Let me continue...', 'I need to...', or any preamble about what "
-            "the problem is asking. Jump straight into the next step of the reasoning."
-        )
-        if is_proof:
-            continue_prompt = (
-                "Continue the reasoning from exactly where it left off. "
-                "Do not restart, repeat previous steps, or add any preamble. "
-                "Jump directly into the next reasoning step and provide a rigorous proof."
-            )
-        else:
-            continue_prompt = (
-                "Continue the reasoning from exactly where it left off. "
-                "Do not restart, repeat previous steps, or add any preamble. "
-                "Jump directly into the next reasoning step and put your final answer within \\boxed{}."
-            )
+        # Use multi-turn: place prefix as a prior assistant turn, then an empty
+        # user turn so the model continues naturally without meta-commentary.
         return [
-            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": prefix},
-            {"role": "user", "content": continue_prompt},
+            {"role": "user", "content": ""},
         ]
     elif model in THINK_TAG_MODELS:
         # Prefill assistant with an open reasoning tag + prefix reasoning.
