@@ -581,6 +581,8 @@ async def main():
                         help="Unused (trace reuse disabled)")
     parser.add_argument("--prefix-dir", type=str, default="prefixes")
     parser.add_argument("--output-dir", type=str, default="suffixes")
+    parser.add_argument("--output-file", type=str, default=None,
+                        help="Override output filename (relative to output-dir)")
     parser.add_argument("--hf-dataset", type=str, default=None,
                         help="Optional HF dataset name/path for prefixes")
     parser.add_argument("--hf-split", type=str, default="train",
@@ -607,11 +609,13 @@ async def main():
 
     if is_random:
         rng = random.Random(args.seed)
-        output_path = Path(args.output_dir) / "random.jsonl"
+        default_name = "random.jsonl"
     else:
         model_cfg = MODELS[model]
         model_id = model_cfg["model_id"]
-        output_path = Path(args.output_dir) / f"{model}.jsonl"
+        default_name = f"{model}.jsonl"
+
+    output_path = Path(args.output_dir) / (args.output_file or default_name)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
